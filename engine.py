@@ -67,6 +67,21 @@ def warn(msg): print(f"{YELLOW}{BOLD}[!]{NC} {msg}")
 def err(msg):  print(f"{RED}{BOLD}[-]{NC} {msg}")
 
 
+def _print_status_bar():
+    """Print the active custom provider + model at the bottom of the screen."""
+    cfg = load_config()
+    provider = os.environ.get("BRAIN_PROVIDER") or cfg.get("provider")
+    if not provider or not provider.startswith("custom:"):
+        return
+    slug = provider.split(":", 1)[1]
+    entry = cfg.get("custom_providers", {}).get(slug, {})
+    model = entry.get("default_model") or cfg.get("model")
+    if not model:
+        return
+    print(f"\n{DIM}{'─'*60}{NC}")
+    print(f"{DIM}  custom provider: {slug}  |  model: {model}{NC}")
+
+
 def header(title: str):
     width = max(len(title) + 4, 60)
     print(f"\n{BOLD}{'═' * width}{NC}")
@@ -789,6 +804,7 @@ def cmd_interactive(args):
     }
 
     while True:
+        _print_status_bar()
         print("\nActions:")
         for k, (_, desc) in actions.items():
             print(f"  {k}) {desc}")
@@ -943,13 +959,16 @@ def main():
             parser.print_help()
             print()
             _print_quick_help()
+            _print_status_bar()
         return
 
     fn = _dispatch_table().get(args.command)
     if fn:
         fn(args)
+        _print_status_bar()
     else:
         parser.print_help()
+        _print_status_bar()
 
 
 if __name__ == "__main__":
