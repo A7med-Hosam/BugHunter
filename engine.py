@@ -207,6 +207,7 @@ def _fetch_custom_models(base_url: str, api_key: str = "") -> list[str]:
     url = base_url.rstrip("/") + "/models"
     req = urllib.request.Request(url)
     req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", "BugHunter/1.0")
     if api_key:
         req.add_header("Authorization", f"Bearer {api_key}")
     try:

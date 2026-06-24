@@ -324,7 +324,7 @@ class LLMClient:
                 return
             import requests
             self._http = requests.Session()
-            headers = {"Content-Type": "application/json"}
+            headers = {"Content-Type": "application/json", "User-Agent": "BugHunter/1.0"}
             if entry.get("api_key"):
                 headers["Authorization"] = f"Bearer {entry['api_key']}"
             self._http.headers.update(headers)
