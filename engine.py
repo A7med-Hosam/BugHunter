@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-engine.py — Standalone BugHunter CLI
+"""engine.py — Standalone BugHunter CLI
 Works WITHOUT Claude Code or any AI subscription.
 
 Providers (auto-detected, first available wins):
@@ -14,6 +13,7 @@ Providers (auto-detected, first available wins):
   PAID:  claude   — set ANTHROPIC_API_KEY
          openai   — set OPENAI_API_KEY
          grok     — set XAI_API_KEY
+  CUSTOM: custom:<slug> — add any OpenAI-compatible endpoint via ./engine.py setup
 
 Usage:
   ./engine.py setup                        one-time config wizard
@@ -27,6 +27,7 @@ Usage:
   ./engine.py models                       list available models
   ./engine.py status                       show hunt status
   ./engine.py providers                    show all providers + API key status
+  ./engine.py                              interactive launcher (TTY)
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ import re
 import subprocess
 import sys
 import textwrap
+import urllib.request
 from pathlib import Path
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
@@ -163,14 +165,14 @@ def _get_client(provider: str | None = None):
 
 
 def _get_brain(provider: str | None = None):
-    """Return a Brain instance."""
+    """Return a Brain instance using saved provider + model."""
     Brain, _ = _import_brain()
     cfg = load_config()
     if not provider and not os.environ.get("BRAIN_PROVIDER"):
         provider = cfg.get("provider")
     if provider:
         os.environ["BRAIN_PROVIDER"] = provider
-    return Brain()
+    return Brain(model=cfg.get("model"))
 
 
 def _run_shell(cmd: str, cwd: str | None = None, timeout: int = 3600) -> tuple[bool, str]:
@@ -193,6 +195,103 @@ def _run_shell(cmd: str, cwd: str | None = None, timeout: int = 3600) -> tuple[b
         return False, str(e)
 
 
+# ── Custom provider helpers ───────────────────────────────────────────────────
+
+def _custom_slug(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return slug or "custom"
+
+
+def _fetch_custom_models(base_url: str, api_key: str = "") -> list[str]:
+    """Fetch OpenAI-compatible /models endpoint using stdlib urllib."""
+    url = base_url.rstrip("/") + "/models"
+    req = urllib.request.Request(url)
+    req.add_header("Accept", "application/json")
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        if isinstance(data, dict) and "data" in data:
+            return [m["id"] if isinstance(m, dict) else m for m in data["data"]]
+        if isinstance(data, list):
+            return [m["id"] if isinstance(m, dict) else m for m in data]
+        return []
+    except Exception as e:
+        err(f"Could not fetch models from {url}: {e}")
+        return []
+
+
+def _setup_custom_provider(cfg: dict) -> tuple[str, str]:
+    """Prompt for custom provider details, save, and return (provider_key, model)."""
+    print()
+    name = input("Provider name: ").strip()
+    if not name:
+        name = "custom"
+    slug = _custom_slug(name)
+
+    base_url = input("Endpoint base URL: ").strip().rstrip("/")
+    while not base_url:
+        warn("Endpoint base URL is required")
+        base_url = input("Endpoint base URL: ").strip().rstrip("/")
+
+    api_key = input("API key (blank for keyless): ").strip()
+
+    info(f"Fetching models from {base_url}/models ...")
+    models = _fetch_custom_models(base_url, api_key)
+
+    if models:
+        ok(f"Found {len(models)} model(s)")
+        for idx, m in enumerate(models, 1):
+            print(f"  {idx}) {m}")
+        choice = input("Choose default model number [1]: ").strip() or "1"
+        try:
+            default_model = models[int(choice) - 1]
+        except (ValueError, IndexError):
+            default_model = models[0]
+    else:
+        warn("No models fetched — enter a model name manually")
+        default_model = input("Default model: ").strip()
+
+    cfg.setdefault("custom_providers", {})[slug] = {
+        "name": name,
+        "base_url": base_url,
+        "api_key": api_key,
+        "models": models,
+        "default_model": default_model,
+    }
+    save_config(cfg)
+    ok(f"Saved custom provider '{name}' ({slug})")
+    return f"custom:{slug}", default_model
+
+
+def _pick_custom_model(entry: dict, cfg: dict, slug: str) -> str:
+    """Re-fetch or use cached models, prompt for default, save, return model."""
+    base_url = entry.get("base_url", "")
+    models = _fetch_custom_models(base_url, entry.get("api_key", "")) or entry.get("models", [])
+    current = entry.get("default_model", "")
+
+    if models:
+        info(f"Models for {entry.get('name', slug)}:")
+        for idx, m in enumerate(models, 1):
+            marker = f" {BOLD}<- current{NC}" if m == current else ""
+            print(f"  {idx}) {m}{marker}")
+        choice = input("Choose model number [1]: ").strip() or "1"
+        try:
+            model = models[int(choice) - 1]
+        except (ValueError, IndexError):
+            model = models[0]
+    else:
+        warn("No models available — enter model name manually")
+        model = input("Model: ").strip() or current
+
+    entry["models"] = models or entry.get("models", [])
+    entry["default_model"] = model
+    cfg["custom_providers"][slug] = entry
+    save_config(cfg)
+    return model
+
+
 # ── Commands ───────────────────────────────────────────────────────────────────
 
 def cmd_setup(args):
@@ -208,16 +307,46 @@ def cmd_setup(args):
         "6": ("grok",     "Grok/xAI (paid)             — needs XAI_API_KEY"),
     }
 
+    cfg = load_config()
+    custom = cfg.get("custom_providers", {}) or {}
+
     print("Choose your AI backend:\n")
     for k, (_, desc) in providers.items():
         print(f"  {k}) {desc}")
+    print("  7) Custom OpenAI-compatible provider (add your own endpoint)")
+    custom_keys = list(custom.keys())
+    for idx, slug in enumerate(custom_keys, start=8):
+        entry = custom[slug]
+        print(f"  {idx}) {entry.get('name', slug)} (custom @ {entry.get('base_url', '')})")
     print()
 
     choice = input("Enter number [1]: ").strip() or "1"
-    provider = providers.get(choice, ("ollama", ""))[0]
+    provider = None
+    model = None
 
-    cfg = load_config()
+    if choice == "7":
+        provider, model = _setup_custom_provider(cfg)
+    elif choice.isdigit() and int(choice) >= 8:
+        idx = int(choice) - 8
+        if 0 <= idx < len(custom_keys):
+            slug = custom_keys[idx]
+            entry = custom[slug]
+            provider = f"custom:{slug}"
+            model = _pick_custom_model(entry, cfg, slug)
+        else:
+            warn("Invalid choice")
+            return
+    else:
+        provider = providers.get(choice, ("ollama", ""))[0]
+
     cfg["provider"] = provider
+    builtin_ids = {p[0] for p in providers.values()}
+    if provider in builtin_ids:
+        cfg.pop("model", None)
+    else:
+        cfg["model"] = model
+    save_config(cfg)
+    ok(f"Config saved to {CONFIG}")
 
     env_map = {
         "groq":     "GROQ_API_KEY",
@@ -239,9 +368,7 @@ def cmd_setup(args):
             info(f"Using existing {env_var} from environment")
         else:
             warn(f"No {env_var} set — provider may not work")
-
-    save_config(cfg)
-    ok(f"Config saved to {CONFIG}")
+        save_config(cfg)
 
     # Test connection
     info("Testing connection...")
@@ -263,6 +390,9 @@ def cmd_setup(args):
             print("    ollama pull qwen2.5:14b")
         elif provider in env_map:
             print(f"\n  {YELLOW}Set API key:{NC}  export {env_map[provider]}=your_key_here")
+        elif provider and provider.startswith("custom:"):
+            print(f"\n  {YELLOW}Check endpoint:{NC}  {cfg.get('custom_providers', {}).get(provider.split(':', 1)[1], {}).get('base_url')}/models")
+            print(f"  {YELLOW}and API key:{NC}  verify the saved key is correct")
 
 
 def cmd_providers(args):
@@ -295,7 +425,6 @@ def cmd_providers(args):
             note    = env_var if not key_set else ""
         else:
             try:
-                import urllib.request
                 urllib.request.urlopen("http://localhost:11434", timeout=1)
                 status = f"{GREEN}running{NC}"
                 note   = ""
@@ -305,6 +434,18 @@ def cmd_providers(args):
 
         marker = f" {BOLD}<- active{NC}" if prov == saved else ""
         print(f"  {BOLD}{prov:<12}{NC} {tier[prov]:<16} {status:<30} {DIM}{note}{NC}{marker}")
+
+    custom = cfg.get("custom_providers", {}) or {}
+    if custom:
+        print(f"\n  {'CUSTOM':<12} {'KEY':<16} {'MODELS':<20} {'NOTE'}")
+        print(f"  {'─'*12} {'─'*16} {'─'*20} {'─'*30}")
+        for slug, entry in custom.items():
+            prov_key = f"custom:{slug}"
+            key_status = f"{GREEN}set{NC}" if entry.get("api_key") else f"{YELLOW}keyless{NC}"
+            models = entry.get("models", [])
+            model_count = f"{len(models)} cached"
+            marker = f" {BOLD}<- active{NC}" if prov_key == saved else ""
+            print(f"  {BOLD}{slug:<12}{NC} {key_status:<16} {model_count:<30} {DIM}{entry.get('name', '')}{NC}{marker}")
 
     print(f"\n  Config: {CONFIG}")
     print(f"  Change: ./engine.py setup\n")
@@ -555,6 +696,129 @@ def cmd_status(args):
     print()
 
 
+def _dispatch_table():
+    """Map command names to handler functions."""
+    return {
+        "setup":     cmd_setup,
+        "providers": cmd_providers,
+        "models":    cmd_models,
+        "recon":     cmd_recon,
+        "hunt":      cmd_hunt,
+        "validate":  cmd_validate,
+        "triage":    cmd_triage,
+        "report":    cmd_report,
+        "chain":     cmd_chain,
+        "chat":      cmd_chat,
+        "status":    cmd_status,
+    }
+
+
+def cmd_interactive(args):
+    """Interactive launcher: choose provider, model, then action."""
+    header("BugHunter Interactive")
+
+    cfg = load_config()
+    custom = cfg.get("custom_providers", {}) or {}
+
+    builtins = [
+        ("ollama",   "Ollama (local)"),
+        ("groq",     "Groq (cloud free tier)"),
+        ("deepseek", "DeepSeek (cloud cheap)"),
+        ("claude",   "Claude (paid)"),
+        ("openai",   "OpenAI (paid)"),
+        ("grok",     "Grok/xAI (paid)"),
+    ]
+
+    print("Choose provider:\n")
+    for idx, (prov, desc) in enumerate(builtins, 1):
+        print(f"  {idx}) {desc}")
+    custom_keys = list(custom.keys())
+    for idx, slug in enumerate(custom_keys, start=len(builtins) + 1):
+        entry = custom[slug]
+        print(f"  {idx}) {entry.get('name', slug)} (custom)")
+    print()
+
+    choice = input("Enter number [1]: ").strip() or "1"
+    if not choice.isdigit():
+        warn("Invalid choice")
+        return
+    c = int(choice)
+
+    if 1 <= c <= len(builtins):
+        provider, _ = builtins[c - 1]
+        os.environ["BRAIN_PROVIDER"] = provider
+        client = _get_client(provider)
+        if not client.available:
+            err(f"Provider '{provider}' not available")
+            return
+        models = client.list_models()
+        if not models:
+            model = input("Model: ").strip()
+        else:
+            for idx, m in enumerate(models, 1):
+                print(f"  {idx}) {m}")
+            m_choice = input("Choose model number [1]: ").strip() or "1"
+            try:
+                model = models[int(m_choice) - 1]
+            except (ValueError, IndexError):
+                model = models[0]
+    elif len(builtins) < c <= len(builtins) + len(custom_keys):
+        slug = custom_keys[c - len(builtins) - 1]
+        provider = f"custom:{slug}"
+        entry = custom[slug]
+        model = _pick_custom_model(entry, cfg, slug)
+    else:
+        warn("Invalid choice")
+        return
+
+    cfg["provider"] = provider
+    cfg["model"] = model
+    save_config(cfg)
+    ok(f"Saved provider={provider} model={model}")
+
+    actions = {
+        "1": ("recon",   "Recon a target"),
+        "2": ("hunt",    "Full hunt pipeline"),
+        "3": ("chat",    "Interactive chat"),
+        "4": ("validate","Validate a finding"),
+        "5": ("report",  "Write report"),
+        "6": ("status",  "Show status"),
+        "7": ("providers","Show providers"),
+        "8": ("quit",    "Quit"),
+    }
+
+    while True:
+        print("\nActions:")
+        for k, (_, desc) in actions.items():
+            print(f"  {k}) {desc}")
+        a_choice = input("\nChoose action [8]: ").strip() or "8"
+        if a_choice not in actions:
+            warn("Invalid action")
+            continue
+        action, _ = actions[a_choice]
+        if action == "quit":
+            break
+
+        if action in {"recon", "hunt"}:
+            target = input("Target: ").strip()
+            if not target:
+                continue
+            ns = argparse.Namespace(target=target, provider=None, no_banner=True)
+        elif action == "validate":
+            finding = input("Finding (one line): ").strip()
+            if not finding:
+                continue
+            ns = argparse.Namespace(finding=finding, provider=None, no_banner=True)
+        else:
+            ns = argparse.Namespace(provider=None, no_banner=True, findings_dir="", finding="")
+
+        fn = _dispatch_table().get(action)
+        if fn:
+            fn(ns)
+        else:
+            warn(f"Action '{action}' not implemented")
+
+
 # ── Utility ────────────────────────────────────────────────────────────────────
 
 def _read_stdin_or_prompt(prompt_text: str) -> str:
@@ -623,7 +887,7 @@ def main():
         """),
     )
     parser.add_argument("--provider", "-p",
-                        help="Force provider: ollama / groq / deepseek / claude / openai / grok")
+                        help="Force provider: ollama / groq / deepseek / claude / openai / grok / custom:<slug>")
     parser.add_argument("--no-banner", action="store_true", help="Suppress banner")
 
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
@@ -671,27 +935,16 @@ def main():
     if not getattr(args, "no_banner", False) and args.command not in quiet_cmds:
         _print_banner()
 
-    dispatch = {
-        "setup":     cmd_setup,
-        "providers": cmd_providers,
-        "models":    cmd_models,
-        "recon":     cmd_recon,
-        "hunt":      cmd_hunt,
-        "validate":  cmd_validate,
-        "triage":    cmd_triage,
-        "report":    cmd_report,
-        "chain":     cmd_chain,
-        "chat":      cmd_chat,
-        "status":    cmd_status,
-    }
-
     if not args.command:
-        parser.print_help()
-        print()
-        _print_quick_help()
+        if sys.stdin.isatty():
+            cmd_interactive(args)
+        else:
+            parser.print_help()
+            print()
+            _print_quick_help()
         return
 
-    fn = dispatch.get(args.command)
+    fn = _dispatch_table().get(args.command)
     if fn:
         fn(args)
     else:

@@ -75,6 +75,7 @@ except ImportError:
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+_BUGHUNTER_CONFIG = Path.home() / ".bughunter" / "config.json"
 
 # ── Multi-provider LLM client ──────────────────────────────────────────────────
 # Wraps Ollama, Claude, OpenAI, Grok behind a single .chat() interface.
@@ -148,11 +149,14 @@ class LLMClient:
     def _auto_detect(self) -> str:
         # Front-load cloud providers whose API keys are set so users with
         # only ANTHROPIC_API_KEY don't wait on an Ollama probe that will
-        # fail or mis-route. Ollama stays as the final fallback.
+        # fail or mis-route. Configured custom providers come next, then
+        # the rest, with Ollama as the final fallback.
         key_providers = [p for p, env in self.PROVIDER_KEY_ENV.items()
                          if os.environ.get(env)]
+        custom = [f"custom:{s}" for s, e in self._load_custom_providers().items()
+                  if e.get("base_url")]
         rest = [p for p in self.PROVIDER_PRIORITY if p not in key_providers]
-        for p in key_providers + rest:
+        for p in key_providers + custom + rest:
             try:
                 self._init_provider(p)
                 if self.available:
@@ -313,6 +317,59 @@ class LLMClient:
             self.available   = True
             self.description = "Perplexity AI (sonar-pro — live web search)"
 
+        elif provider.startswith("custom:"):
+            slug = provider.split(":", 1)[1]
+            entry = self._load_custom_providers().get(slug)
+            if not entry or not entry.get("base_url"):
+                return
+            import requests
+            self._http = requests.Session()
+            headers = {"Content-Type": "application/json"}
+            if entry.get("api_key"):
+                headers["Authorization"] = f"Bearer {entry['api_key']}"
+            self._http.headers.update(headers)
+            self._api_base   = entry["base_url"].rstrip("/")
+            self._custom_slug = slug
+            self._custom_name = entry.get("name", slug)
+            self.available   = True
+            self.description = f"{self._custom_name} (custom @ {self._api_base})"
+
+    @staticmethod
+    def _load_custom_providers() -> dict:
+        """Read custom_providers from ~/.bughunter/config.json."""
+        try:
+            if not _BUGHUNTER_CONFIG.exists():
+                return {}
+            data = json.loads(_BUGHUNTER_CONFIG.read_text())
+            return data.get("custom_providers", {}) or {}
+        except Exception:
+            return {}
+
+    def default_model(self) -> str | None:
+        """Return the default model for the active provider."""
+        if self.provider.startswith("custom:"):
+            entry = self._load_custom_providers().get(self._custom_slug)
+            if entry:
+                return entry.get("default_model") or (entry.get("models", [None]) or [None])[0]
+            return None
+        return self.DEFAULT_MODELS.get(self.provider)
+
+    def _list_custom_models(self) -> list[str]:
+        """Fetch models from a custom provider's /models endpoint."""
+        if not getattr(self, "_api_base", None):
+            return []
+        try:
+            r = self._http.get(f"{self._api_base}/models", timeout=60)
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict) and "data" in data:
+                return [m["id"] if isinstance(m, dict) else m for m in data["data"]]
+            if isinstance(data, list):
+                return [m["id"] if isinstance(m, dict) else m for m in data]
+            return []
+        except Exception:
+            return []
+
     def chat(self, model: str | None, system: str, user: str,
              max_tokens: int = 4000, temperature: float = 0.1) -> str:
         """Send a chat request; return the assistant reply as a string."""
@@ -326,7 +383,7 @@ class LLMClient:
             elif self.provider in (
                 "openai", "grok", "groq", "deepseek",
                 "gemini", "kimi", "mistral", "together", "cerebras", "perplexity",
-            ):
+            ) or self.provider.startswith("custom:"):
                 return self._chat_openai_compat(model, system, user, max_tokens, temperature)
         except Exception as e:
             print(f"{YELLOW}[Brain/{self.provider}] chat error: {e}{NC}", flush=True)
@@ -368,7 +425,13 @@ class LLMClient:
     def _chat_openai_compat(self, model, system, user, max_tokens, temperature) -> str:
         import json as _json
         base = self._api_base
-        m    = model or self.DEFAULT_MODELS[self.provider]
+        m    = model or self.default_model()
+        if not m:
+            available = self.list_models()
+            m = available[0] if available else None
+        if not m:
+            print(f"{YELLOW}[Brain/{self.provider}] no model available{NC}", flush=True)
+            return ""
         body = {"model": m, "max_tokens": max_tokens, "temperature": temperature,
                 "messages": [{"role": "system", "content": system},
                              {"role": "user",   "content": user}]}
@@ -411,6 +474,8 @@ class LLMClient:
             return ["llama3.3-70b", "llama3.1-8b"]
         elif self.provider == "perplexity":
             return ["sonar-pro", "sonar", "sonar-reasoning-pro", "sonar-reasoning"]
+        elif self.provider.startswith("custom:"):
+            return self._list_custom_models()
         return []
 
 # Model preference order — first available wins
@@ -577,7 +642,7 @@ class Brain:
             self.client = self._llm._ollama  # backward compat for code that uses self.client
             self.triage_model = _pick_triage_model() or self.model
         else:
-            self.model        = model or LLMClient.DEFAULT_MODELS.get(self._llm.provider)
+            self.model        = model or self._llm.default_model()
             self.triage_model = self.model
             self.client       = None  # not used for cloud providers
 
