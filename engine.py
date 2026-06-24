@@ -729,26 +729,48 @@ def _dispatch_table():
     }
 
 
-def cmd_interactive(args):
-    """Interactive launcher: choose provider, model, then action."""
-    header("BugHunter Interactive")
+_BUILTIN_PROVIDERS = [
+    ("ollama",   "Ollama (local)"),
+    ("groq",     "Groq (cloud free tier)"),
+    ("deepseek", "DeepSeek (cloud cheap)"),
+    ("claude",   "Claude (paid)"),
+    ("openai",   "OpenAI (paid)"),
+    ("grok",     "Grok/xAI (paid)"),
+]
 
-    cfg = load_config()
+
+def _select_builtin_model(provider: str, cfg: dict) -> str | None:
+    """Prompt for a model from a built-in provider."""
+    client = _get_client(provider)
+    if not client.available:
+        err(f"Provider '{provider}' not available")
+        return None
+    models = client.list_models()
+    if not models:
+        return input("Model: ").strip()
+    current = cfg.get("model")
+    for idx, m in enumerate(models, 1):
+        marker = f" {BOLD}<- current{NC}" if m == current else ""
+        print(f"  {idx}) {m}{marker}")
+    default_idx = "1"
+    if current in models:
+        default_idx = str(models.index(current) + 1)
+    m_choice = input(f"Choose model number [{default_idx}]: ").strip() or default_idx
+    try:
+        return models[int(m_choice) - 1]
+    except (ValueError, IndexError):
+        return models[0]
+
+
+def _select_provider_and_model(cfg: dict) -> tuple[str | None, str | None]:
+    """Prompt for provider and model, return (provider, model) or (None, None)."""
+    builtins = _BUILTIN_PROVIDERS
     custom = cfg.get("custom_providers", {}) or {}
-
-    builtins = [
-        ("ollama",   "Ollama (local)"),
-        ("groq",     "Groq (cloud free tier)"),
-        ("deepseek", "DeepSeek (cloud cheap)"),
-        ("claude",   "Claude (paid)"),
-        ("openai",   "OpenAI (paid)"),
-        ("grok",     "Grok/xAI (paid)"),
-    ]
+    custom_keys = list(custom.keys())
 
     print("Choose provider:\n")
     for idx, (prov, desc) in enumerate(builtins, 1):
         print(f"  {idx}) {desc}")
-    custom_keys = list(custom.keys())
     for idx, slug in enumerate(custom_keys, start=len(builtins) + 1):
         entry = custom[slug]
         print(f"  {idx}) {entry.get('name', slug)} (custom)")
@@ -757,27 +779,14 @@ def cmd_interactive(args):
     choice = input("Enter number [1]: ").strip() or "1"
     if not choice.isdigit():
         warn("Invalid choice")
-        return
+        return None, None
     c = int(choice)
 
     if 1 <= c <= len(builtins):
         provider, _ = builtins[c - 1]
-        os.environ["BRAIN_PROVIDER"] = provider
-        client = _get_client(provider)
-        if not client.available:
-            err(f"Provider '{provider}' not available")
-            return
-        models = client.list_models()
-        if not models:
-            model = input("Model: ").strip()
-        else:
-            for idx, m in enumerate(models, 1):
-                print(f"  {idx}) {m}")
-            m_choice = input("Choose model number [1]: ").strip() or "1"
-            try:
-                model = models[int(m_choice) - 1]
-            except (ValueError, IndexError):
-                model = models[0]
+        model = _select_builtin_model(provider, cfg)
+        if model is None:
+            return None, None
     elif len(builtins) < c <= len(builtins) + len(custom_keys):
         slug = custom_keys[c - len(builtins) - 1]
         provider = f"custom:{slug}"
@@ -785,12 +794,88 @@ def cmd_interactive(args):
         model = _pick_custom_model(entry, cfg, slug)
     else:
         warn("Invalid choice")
-        return
+        return None, None
 
-    cfg["provider"] = provider
-    cfg["model"] = model
-    save_config(cfg)
-    ok(f"Saved provider={provider} model={model}")
+    return provider, model
+
+
+def _restore_saved_provider(cfg: dict) -> str | None:
+    """Activate the previously saved provider if it is still valid."""
+    provider = cfg.get("provider")
+    if not provider:
+        return None
+    if provider.startswith("custom:"):
+        slug = provider.split(":", 1)[1]
+        if slug not in cfg.get("custom_providers", {}):
+            return None
+    elif provider not in {p for p, _ in _BUILTIN_PROVIDERS}:
+        return None
+    os.environ["BRAIN_PROVIDER"] = provider
+    return provider
+
+
+def _provider_options_menu(cfg: dict):
+    """Submenu to change provider or model."""
+    while True:
+        print("\nProvider options:\n")
+        print("  1) Change provider")
+        print("  2) Change model")
+        print("  3) Back")
+        choice = input("\nChoose [3]: ").strip() or "3"
+        if choice == "1":
+            provider, model = _select_provider_and_model(cfg)
+            if provider:
+                cfg["provider"] = provider
+                cfg["model"] = model
+                save_config(cfg)
+                ok(f"Saved provider={provider} model={model}")
+            return
+        elif choice == "2":
+            provider = cfg.get("provider")
+            if not provider:
+                warn("No provider selected")
+                continue
+            if provider.startswith("custom:"):
+                slug = provider.split(":", 1)[1]
+                entry = cfg.get("custom_providers", {}).get(slug, {})
+                model = _pick_custom_model(entry, cfg, slug)
+            else:
+                model = _select_builtin_model(provider, cfg)
+            if model:
+                cfg["model"] = model
+                cfg["provider"] = provider
+                save_config(cfg)
+                ok(f"Saved model={model}")
+            return
+        elif choice == "3":
+            return
+        else:
+            warn("Invalid choice")
+
+
+def cmd_interactive(args):
+    """Interactive launcher: restore saved provider/model, then action loop."""
+    header("BugHunter Interactive")
+
+    cfg = load_config()
+    provider = _restore_saved_provider(cfg)
+
+    if not provider:
+        provider, model = _select_provider_and_model(cfg)
+        if not provider:
+            return
+        cfg["provider"] = provider
+        cfg["model"] = model
+        save_config(cfg)
+        ok(f"Saved provider={provider} model={model}")
+    else:
+        if provider.startswith("custom:"):
+            slug = provider.split(":", 1)[1]
+            entry = cfg.get("custom_providers", {}).get(slug, {})
+            model = entry.get("default_model") or cfg.get("model")
+        else:
+            model = cfg.get("model")
+        ok(f"Using saved provider={provider} model={model or 'default'}")
 
     actions = {
         "1": ("recon",   "Recon a target"),
@@ -801,6 +886,7 @@ def cmd_interactive(args):
         "6": ("status",  "Show status"),
         "7": ("providers","Show providers"),
         "8": ("quit",    "Quit"),
+        "9": ("provider_options", "Provider options"),
     }
 
     while True:
@@ -815,6 +901,10 @@ def cmd_interactive(args):
         action, _ = actions[a_choice]
         if action == "quit":
             break
+
+        if action == "provider_options":
+            _provider_options_menu(cfg)
+            continue
 
         if action in {"recon", "hunt"}:
             target = input("Target: ").strip()
