@@ -704,11 +704,23 @@ def cmd_status(args):
         print(f"    {GREEN}•{NC} {t.name}: {len(list(t.glob('*.md')))} report(s)")
 
     print(f"\n  {BOLD}Provider:{NC} ", end="")
-    client = _get_client()
-    if client.available:
-        print(f"{GREEN}{client.description}{NC}")
-    else:
+    cfg = load_config()
+    provider = os.environ.get("BRAIN_PROVIDER") or cfg.get("provider")
+    if not provider:
         print(f"{RED}not configured{NC} — run: ./engine.py setup")
+    elif provider.startswith("custom:"):
+        slug = provider.split(":", 1)[1]
+        entry = cfg.get("custom_providers", {}).get(slug, {})
+        name = entry.get("name", slug)
+        model = entry.get("default_model") or cfg.get("model", "")
+        print(f"{GREEN}{name} (custom){NC}")
+        if model:
+            print(f"  {BOLD}Model:{NC} {GREEN}{model}{NC}")
+    else:
+        print(f"{GREEN}{provider}{NC}")
+        model = cfg.get("model")
+        if model:
+            print(f"  {BOLD}Model:{NC} {GREEN}{model}{NC}")
     print()
 
 
